@@ -8,6 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 import openpyxl
 import datetime
 import os
+from openpyxl.utils import get_column_letter
 
 # ─── Paleta de cores ────────────────────────────────────────────────────────
 BG        = "#F8F8F6"
@@ -26,6 +27,13 @@ FONT_SM   = ("Segoe UI", 9)
 FONT_LG   = ("Segoe UI", 13, "bold")
 FONT_MONO = ("Consolas", 10)
 
+TRACKING_FILE_NAME = "RUMO.Atualizacoes.xlsx"
+ACTIVE_SHEET_NAME = "RUMO.Numeros_Ativos"
+NOTFOUND_SHEET_NAME = "RUMO.Chips_Nofound"
+BARCODE_COLUMN_INDEX = 10
+SEARCH_BUTTON_TEXT = "▶  Iniciar comparação"
+SEARCHING_BUTTON_TEXT = "Buscando…"
+
 
 class BarcodeChecker(tk.Tk):
     def __init__(self):
@@ -37,6 +45,7 @@ class BarcodeChecker(tk.Tk):
         self.resizable(True, True)
 
         self.excel_path = tk.StringVar(value="")
+        self.sync_results_var = tk.BooleanVar(value=False)
         self.barcodes: list[str] = []
         self.results: list[dict] = []
 
@@ -139,7 +148,7 @@ class BarcodeChecker(tk.Tk):
         # ── Coluna direita ───────────────────────────────────────────
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, rowspan=2, sticky="nsew")
-        right.rowconfigure(5, weight=1)
+        right.rowconfigure(6, weight=1)
         right.columnconfigure(0, weight=1)
 
         # Seleção do Excel
@@ -164,27 +173,42 @@ class BarcodeChecker(tk.Tk):
                   activebackground=BG, cursor="hand2",
                   padx=10, pady=5).pack(side="right")
 
+        self.sync_check = tk.Checkbutton(
+            right,
+            text="Atualizar planilha RUMO",
+            variable=self.sync_results_var,
+            font=FONT_SM,
+            bg=BG,
+            fg=TEXT,
+            activebackground=BG,
+            activeforeground=TEXT,
+            selectcolor=SURFACE,
+            cursor="hand2",
+            anchor="w",
+        )
+        self.sync_check.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
         # Botão buscar
-        self.btn_search = tk.Button(right, text="▶  Iniciar comparação",
+        self.btn_search = tk.Button(right, text=SEARCH_BUTTON_TEXT,
                                     font=FONT_BOLD, command=self._run_search,
                                     bg=SUCCESS, fg="white", relief="flat",
                                     activebackground="#27500A",
                                     activeforeground="white",
                                     cursor="hand2", padx=16, pady=8)
-        self.btn_search.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        self.btn_search.grid(row=3, column=0, sticky="e", pady=(12, 0))
 
         # Separador
         ttk.Separator(right, orient="horizontal").grid(
-            row=3, column=0, sticky="ew", pady=(10, 6))
+            row=4, column=0, sticky="ew", pady=(10, 6))
 
         # Resultado / Histórico
         tk.Label(right, text="Histórico de resultados", font=FONT_BOLD,
-                 bg=BG, fg=TEXT).grid(row=4, column=0, sticky="w", pady=(0, 4))
+                 bg=BG, fg=TEXT).grid(row=5, column=0, sticky="w", pady=(0, 4))
 
         # Treeview resultado
         tree_frame = tk.Frame(right, bg=SURFACE,
                               highlightthickness=1, highlightbackground=BORDER)
-        tree_frame.grid(row=5, column=0, sticky="nsew")
+        tree_frame.grid(row=6, column=0, sticky="nsew")
 
         cols = ("barcode", "sheet", "col", "row", "cell", "status")
         self.tree = ttk.Treeview(tree_frame, columns=cols,
@@ -197,7 +221,7 @@ class BarcodeChecker(tk.Tk):
             "col":     ("Coluna",  60),
             "row":     ("Linha",   55),
             "cell":    ("Célula",  65),
-            "status":  ("Status", 100),
+            "status":  ("Status", 220),
         }
         for col, (label, width) in headers.items():
             self.tree.heading(col, text=label)
@@ -212,7 +236,7 @@ class BarcodeChecker(tk.Tk):
 
         # Rodapé
         footer = tk.Frame(right, bg=BG)
-        footer.grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        footer.grid(row=7, column=0, sticky="ew", pady=(6, 0))
 
         tk.Button(footer, text="Exportar histórico (.txt)",
                   font=FONT_SM, command=self._export_history,
@@ -346,6 +370,99 @@ class BarcodeChecker(tk.Tk):
             self.excel_path.set(path)
             self._set_status(f"Excel: {os.path.basename(path)}")
 
+    def _get_tracking_workbook_path(self, source_path: str) -> str:
+        folder = os.path.dirname(source_path) or os.getcwd()
+        return os.path.join(folder, TRACKING_FILE_NAME)
+
+    def _get_source_headers(self, workbook) -> list:
+        if not workbook.sheetnames:
+            return [""] * BARCODE_COLUMN_INDEX
+
+        header_row = [cell.value for cell in workbook[workbook.sheetnames[0]][1]]
+        while header_row and (header_row[-1] is None or str(header_row[-1]).strip() == ""):
+            header_row.pop()
+
+        headers = ["" if value is None else value for value in header_row]
+        if len(headers) < BARCODE_COLUMN_INDEX:
+            headers.extend([""] * (BARCODE_COLUMN_INDEX - len(headers)))
+        return headers
+
+    def _ensure_sheet_headers(self, ws, headers: list):
+        existing = [ws.cell(row=1, column=col).value for col in range(1, len(headers) + 1)]
+        if any(value not in (None, "") for value in existing):
+            return
+
+        for col_idx, value in enumerate(headers, start=1):
+            ws.cell(row=1, column=col_idx, value=value)
+
+    def _open_tracking_workbook(self, source_wb, source_path: str):
+        tracking_path = self._get_tracking_workbook_path(source_path)
+        headers = self._get_source_headers(source_wb)
+        created = not os.path.exists(tracking_path)
+
+        if created:
+            tracking_wb = openpyxl.Workbook()
+            default_sheet = tracking_wb.active
+            tracking_wb.remove(default_sheet)
+        else:
+            tracking_wb = openpyxl.load_workbook(tracking_path)
+
+        for sheet_name in (ACTIVE_SHEET_NAME, NOTFOUND_SHEET_NAME):
+            if sheet_name not in tracking_wb.sheetnames:
+                tracking_wb.create_sheet(sheet_name)
+            self._ensure_sheet_headers(tracking_wb[sheet_name], headers)
+
+        return (
+            tracking_wb,
+            tracking_wb[ACTIVE_SHEET_NAME],
+            tracking_wb[NOTFOUND_SHEET_NAME],
+            tracking_path,
+            headers,
+            created,
+        )
+
+    def _row_values_until_last_filled(self, ws, row_number: int) -> list:
+        row_values = [cell.value for cell in ws[row_number]]
+        while row_values and (row_values[-1] is None or str(row_values[-1]).strip() == ""):
+            row_values.pop()
+
+        if len(row_values) < BARCODE_COLUMN_INDEX:
+            row_values.extend([""] * (BARCODE_COLUMN_INDEX - len(row_values)))
+        return row_values
+
+    def _sheet_has_barcode(self, ws, code: str) -> bool:
+        if ws.max_row < 2:
+            return False
+
+        for (value,) in ws.iter_rows(
+                min_row=2,
+                max_row=ws.max_row,
+                min_col=BARCODE_COLUMN_INDEX,
+                max_col=BARCODE_COLUMN_INDEX,
+                values_only=True):
+            if value is not None and str(value).strip() == code:
+                return True
+        return False
+
+    def _append_found_to_tracking(self, ws, code: str, row_values: list) -> bool:
+        if self._sheet_has_barcode(ws, code):
+            return False
+
+        values = list(row_values)
+        if len(values) < BARCODE_COLUMN_INDEX:
+            values.extend([""] * (BARCODE_COLUMN_INDEX - len(values)))
+        ws.append(values)
+        return True
+
+    def _append_notfound_to_tracking(self, ws, code: str, header_len: int) -> bool:
+        if self._sheet_has_barcode(ws, code):
+            return False
+
+        row_values = [""] * max(header_len, BARCODE_COLUMN_INDEX)
+        row_values[BARCODE_COLUMN_INDEX - 1] = code
+        ws.append(row_values)
+        return True
+
     # ─── Comparação ──────────────────────────────────────────────────────────
 
     def _run_search(self):
@@ -357,80 +474,139 @@ class BarcodeChecker(tk.Tk):
             messagebox.showwarning("Atenção", "Selecione um arquivo Excel válido.")
             return
 
-        self.btn_search.config(state="disabled", text="Buscando…")
+        self.results.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.btn_search.config(state="disabled", text=SEARCHING_BUTTON_TEXT)
         self.update_idletasks()
 
+        wb = None
+        tracking_wb = None
+        active_ws = None
+        notfound_ws = None
+        tracking_path = ""
+        tracking_headers: list = []
+        tracking_created = False
+        sync_enabled = self.sync_results_var.get()
+
         try:
-            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(path, data_only=True)
         except Exception as exc:
             messagebox.showerror("Erro ao abrir Excel", str(exc))
-            self.btn_search.config(state="normal", text="▶  Iniciar comparação")
             return
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            if sync_enabled:
+                tracking_wb, active_ws, notfound_ws, tracking_path, tracking_headers, tracking_created = (
+                    self._open_tracking_workbook(wb, path)
+                )
 
-        # Índice rápido: valor → lista de (aba, col_letter, row_num)
-        index: dict[str, list] = {}
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value is not None:
-                        key = str(cell.value).strip()
-                        if key not in index:
-                            index[key] = []
-                        from openpyxl.utils import get_column_letter
-                        col_letter = get_column_letter(cell.column)
-                        index[key].append({
-                            "sheet": sheet_name,
-                            "col":   col_letter,
-                            "row":   cell.row,
-                            "cell":  f"{col_letter}{cell.row}",
-                        })
-        wb.close()
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        found_count = 0
-        not_found_count = 0
+            # Índice rápido: valor → lista de (aba, col_letter, row_num)
+            index: dict[str, list] = {}
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value is not None:
+                            key = str(cell.value).strip()
+                            if key not in index:
+                                index[key] = []
+                            col_letter = get_column_letter(cell.column)
+                            index[key].append({
+                                "sheet": sheet_name,
+                                "col":   col_letter,
+                                "row":   cell.row,
+                                "cell":  f"{col_letter}{cell.row}",
+                            })
 
-        for code in self.barcodes:
-            matches = index.get(code, [])
-            if matches:
-                for m in matches:
+            found_count = 0
+            not_found_count = 0
+
+            for code in self.barcodes:
+                matches = index.get(code, [])
+                sync_status = ""
+
+                if matches and sync_enabled:
+                    first_match = matches[0]
+                    row_values = self._row_values_until_last_filled(
+                        wb[first_match["sheet"]],
+                        first_match["row"],
+                    )
+                    was_added = self._append_found_to_tracking(active_ws, code, row_values)
+                    sync_status = "Adicionado" if was_added else "Já há - Duplicado"
+
+                if not matches and sync_enabled:
+                    was_added = self._append_notfound_to_tracking(
+                        notfound_ws,
+                        code,
+                        len(tracking_headers),
+                    )
+                    sync_status = "Adicionado" if was_added else "Já há - Duplicado"
+
+                if matches:
+                    status_text = "Encontrado"
+                    if sync_status:
+                        status_text = f"{status_text} | {sync_status}"
+
+                    for m in matches:
+                        record = {
+                            "ts":      timestamp,
+                            "barcode": code,
+                            "sheet":   m["sheet"],
+                            "col":     m["col"],
+                            "row":     m["row"],
+                            "cell":    m["cell"],
+                            "status":  status_text,
+                        }
+                        self.results.append(record)
+                        self.tree.insert("", "end",
+                                         values=(code, m["sheet"], m["col"],
+                                                 m["row"], m["cell"], f"✔ {status_text}"),
+                                         tags=("found",))
+                    found_count += 1
+                else:
+                    status_text = "Não encontrado"
+                    if sync_status:
+                        status_text = f"{status_text} | {sync_status}"
+
                     record = {
                         "ts":      timestamp,
                         "barcode": code,
-                        "sheet":   m["sheet"],
-                        "col":     m["col"],
-                        "row":     m["row"],
-                        "cell":    m["cell"],
-                        "status":  "Encontrado",
+                        "sheet":   "—",
+                        "col":     "—",
+                        "row":     "—",
+                        "cell":    "—",
+                        "status":  status_text,
                     }
                     self.results.append(record)
                     self.tree.insert("", "end",
-                                     values=(code, m["sheet"], m["col"],
-                                             m["row"], m["cell"], "✔ Encontrado"),
-                                     tags=("found",))
-                found_count += 1
-            else:
-                record = {
-                    "ts":      timestamp,
-                    "barcode": code,
-                    "sheet":   "—",
-                    "col":     "—",
-                    "row":     "—",
-                    "cell":    "—",
-                    "status":  "Não encontrado",
-                }
-                self.results.append(record)
-                self.tree.insert("", "end",
-                                 values=(code, "—", "—", "—", "—",
-                                         "✘ Não encontrado"),
-                                 tags=("notfound",))
-                not_found_count += 1
+                                     values=(code, "—", "—", "—", "—",
+                                             f"✘ {status_text}"),
+                                     tags=("notfound",))
+                    not_found_count += 1
 
-        self.btn_search.config(state="normal", text="▶  Iniciar comparação")
-        self._set_status(
-            f"Concluído — {found_count} encontrado(s), {not_found_count} não encontrado(s).")
+            if tracking_wb is not None:
+                tracking_wb.save(tracking_path)
+
+            status_msg = (
+                f"Concluído — {found_count} encontrado(s), "
+                f"{not_found_count} não encontrado(s)."
+            )
+            if tracking_wb is not None:
+                verb = "criada e atualizada" if tracking_created else "atualizada"
+                status_msg += f" Planilha auxiliar {verb}: {os.path.basename(tracking_path)}."
+            self._set_status(status_msg)
+        except Exception as exc:
+            messagebox.showerror("Erro na comparação", str(exc))
+        finally:
+            if tracking_wb is not None:
+                tracking_wb.close()
+            if wb is not None:
+                wb.close()
+            self.btn_search.config(state="normal", text=SEARCH_BUTTON_TEXT)
 
     # ─── Exportar ────────────────────────────────────────────────────────────
 
